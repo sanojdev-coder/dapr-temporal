@@ -1,0 +1,224 @@
+version: "3.8"
+
+x-podman:
+  tls-verify: false
+
+networks:
+  poc-net:
+    driver: bridge
+
+services:
+  # ---------- infra ----------
+  postgres:
+    image: postgres:17
+    pull_policy: never
+    container_name: postgres
+    environment:
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_USER: temporal
+    ports:
+      - "5432:5432"
+    networks:
+      - poc-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    pull_policy: never
+    container_name: temporal
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgres
+      PROMETHEUS_ENDPOINT: 0.0.0.0:9090
+      # NOTE: do not override DYNAMIC_CONFIG_FILE_PATH -- the auto-setup
+      # image's own entrypoint already points this at a file that exists
+      # inside the image. Pointing it at development-sql.yaml (not present
+      # in this image) makes the server fail to start, which is what was
+      # causing the "temporal: Name or service not known" errors below.
+    ports:
+      - "7233:7233"
+    networks:
+      - poc-net
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    pull_policy: never
+    container_name: temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8233:8080"
+    networks:
+      - poc-net
+
+  redis:
+    image: redis:7-alpine
+    pull_policy: never
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - poc-net
+
+  # ---------- fraud-service ----------
+  # Now Temporal-aware: it consumes the async fraud-check-requests event via
+  # Dapr Pub/Sub, then signals the originating workflow directly using the
+  # Temporal WorkflowClient (see TemporalClientConfig / FraudCheckSubscriber).
+  fraud-service:
+    build: ./fraud-service
+    container_name: fraud-service
+    restart: on-failure:5
+    environment:
+      TEMPORAL_SERVICE_ADDRESS: temporal:7233
+    networks:
+      - poc-net
+    expose:
+      - "8081"
+    depends_on:
+      - temporal
+
+  fraud-service-dapr:
+    image: daprio/dapr:latest
+    pull_policy: never
+    container_name: fraud-service-dapr
+    command:
+      [
+        "/daprd",
+        "-app-id", "fraud-service",
+        "-app-port", "8081",
+        "-dapr-http-port", "3500",
+        "-resources-path", "/components",
+        "-config", "/components/tracing-config.yaml"
+      ]
+    volumes:
+      - ./dapr/components:/components
+    network_mode: "service:fraud-service"
+    depends_on:
+      - fraud-service
+      - tempo
+
+  # ---------- notification-service ----------
+  notification-service:
+    build: ./notification-service
+    container_name: notification-service
+    networks:
+      - poc-net
+    expose:
+      - "8082"
+    depends_on:
+      - redis
+
+  notification-service-dapr:
+    image: daprio/dapr:latest
+    pull_policy: never
+    container_name: notification-service-dapr
+    command:
+      [
+        "/daprd",
+        "-app-id", "notification-service",
+        "-app-port", "8082",
+        "-dapr-http-port", "3500",
+        "-resources-path", "/components",
+        "-config", "/components/tracing-config.yaml"
+      ]
+    volumes:
+      - ./dapr/components:/components
+    network_mode: "service:notification-service"
+    depends_on:
+      - notification-service
+      - tempo
+
+  # ---------- payment-service ----------
+  payment-service:
+    build: ./payment-service
+    container_name: payment-service
+    restart: on-failure:5
+    environment:
+      TEMPORAL_SERVICE_ADDRESS: temporal:7233
+    networks:
+      - poc-net
+    ports:
+      - "8080:8080"
+    depends_on:
+      - temporal
+      - redis
+      - fraud-service-dapr
+      - notification-service-dapr
+
+  payment-service-dapr:
+    image: daprio/dapr:latest
+    pull_policy: never
+    container_name: payment-service-dapr
+    command:
+      [
+        "/daprd",
+        "-app-id", "payment-service",
+        "-app-port", "8080",
+        "-dapr-http-port", "3500",
+        "-resources-path", "/components",
+        "-config", "/components/tracing-config.yaml"
+      ]
+    volumes:
+      - ./dapr/components:/components
+    network_mode: "service:payment-service"
+    depends_on:
+      - payment-service
+      - tempo
+
+  # ---------- observability ----------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    pull_policy: never
+    container_name: prometheus
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9091:9090"
+    networks:
+      - poc-net
+
+  tempo:
+    image: grafana/tempo:2.5.0
+    pull_policy: never
+    container_name: tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo/tempo.yaml
+    ports:
+      - "3200:3200"   # Tempo query API (used by Grafana)
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    networks:
+      - poc-net
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    pull_policy: never
+    container_name: grafana
+    depends_on:
+      - prometheus
+      - tempo
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_FEATURE_TOGGLES_ENABLE: traceqlSearch
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    networks:
+      - poc-net

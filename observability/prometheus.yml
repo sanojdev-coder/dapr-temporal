@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: 'temporal'
+    static_configs:
+      - targets: ['temporal:9090']
+
+  # Each daprd sidecar shares its app container's network namespace
+  # (network_mode: "service:<app>"), so it's reachable at the app's own
+  # hostname on its own metrics port (default 9090).
+  - job_name: 'dapr-sidecars'
+    static_configs:
+      - targets:
+          - 'payment-service:9090'
+          - 'fraud-service:9090'
+          - 'notification-service:9090'
+
+  - job_name: 'spring-boot-apps'
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - 'payment-service:8080'
+          - 'fraud-service:8081'
+          - 'notification-service:8082'
